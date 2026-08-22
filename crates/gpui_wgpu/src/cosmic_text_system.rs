@@ -227,36 +227,50 @@ impl CosmicTextSystemState {
         // recurse with `fallbacks = None` so a fallback family cannot pull in
         // another chain. missing fallback families are dropped so a typo in
         // settings still lets the primary family load.
-        let user_fallback_chain: Arc<[(FontId, SharedString)]> = match fallbacks {
-            Some(fallbacks) if !fallbacks.fallback_list().is_empty() => {
-                let mut chain: Vec<(FontId, SharedString)> = Vec::new();
-                for fallback_name in fallbacks.fallback_list() {
-                    let fb_key = FontKey::new(
-                        SharedString::from(fallback_name.clone()),
-                        features.clone(),
-                        None,
-                    );
-                    let fb_ids = if let Some(cached) = self.font_ids_by_family_cache.get(&fb_key) {
-                        cached.clone()
-                    } else {
-                        let loaded = self.load_family(fallback_name, features, None)?;
-                        self.font_ids_by_family_cache
-                            .insert(fb_key.clone(), loaded.clone());
-                        loaded
-                    };
-                    let Some(&fb_id) = fb_ids.first() else {
-                        continue;
-                    };
-                    let db_id = self.loaded_fonts[fb_id.0].font.id();
-                    if let Some(face) = self.font_system.db().face(db_id)
-                        && let Some(family) = face.families.first()
-                    {
-                        chain.push((fb_id, SharedString::from(family.0.clone())));
-                    }
-                }
-                Arc::from(chain)
+        let is_target_emoji = check_is_known_emoji_font(name)
+            || name == "Noto Color Emoji"
+            || name == "NotoColorEmoji";
+
+        let user_fallback_chain: Arc<[(FontId, SharedString)]> = {
+            let mut chain: Vec<(FontId, SharedString)> = Vec::new();
+            let mut names_to_load: Vec<String> = match fallbacks {
+                Some(fallbacks) => fallbacks.fallback_list().to_vec(),
+                None => Vec::new(),
+            };
+
+            if !is_target_emoji
+                && !names_to_load.iter().any(|n| {
+                    n == "Noto Color Emoji" || n == "NotoColorEmoji" || check_is_known_emoji_font(n)
+                })
+            {
+                names_to_load.push("Noto Color Emoji".to_string());
             }
-            _ => Arc::from(Vec::new()),
+
+            for fallback_name in names_to_load {
+                let fb_key = FontKey::new(
+                    SharedString::from(fallback_name.clone()),
+                    features.clone(),
+                    None,
+                );
+                let fb_ids = if let Some(cached) = self.font_ids_by_family_cache.get(&fb_key) {
+                    cached.clone()
+                } else {
+                    let loaded = self.load_family(&fallback_name, features, None)?;
+                    self.font_ids_by_family_cache
+                        .insert(fb_key.clone(), loaded.clone());
+                    loaded
+                };
+                let Some(&fb_id) = fb_ids.first() else {
+                    continue;
+                };
+                let db_id = self.loaded_fonts[fb_id.0].font.id();
+                if let Some(face) = self.font_system.db().face(db_id)
+                    && let Some(family) = face.families.first()
+                {
+                    chain.push((fb_id, SharedString::from(family.0.clone())));
+                }
+            }
+            Arc::from(chain)
         };
 
         let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback);
@@ -282,10 +296,15 @@ impl CosmicTextSystemState {
             let allowed_bad_font_names = [
                 "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
                 "Segoe Fluent Icons",
+                "NotoColorEmoji",
+                "Noto Color Emoji",
             ];
+
+            let is_emoji = check_is_known_emoji_font(&postscript_name);
 
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
+                && !is_emoji
             {
                 self.font_system.db_mut().remove_face(font.id());
                 continue;
@@ -296,7 +315,7 @@ impl CosmicTextSystemState {
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: cosmic_features.clone(),
-                is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                is_known_emoji_font: is_emoji,
                 user_fallback_chain: Arc::clone(&user_fallback_chain),
             });
         }
@@ -905,6 +924,27 @@ fn slot_font_id(
     }
 }
 
+fn is_emoji_char(ch: char) -> bool {
+    let u = ch as u32;
+    matches!(
+        u,
+        0x200D
+        | 0xFE0E | 0xFE0F
+        | 0x203C | 0x2049
+        | 0x2122 | 0x2139
+        | 0x2194..=0x2199 | 0x21A9..=0x21AA
+        | 0x231A | 0x231B | 0x2328 | 0x23CF | 0x23E9..=0x23F3 | 0x23F8..=0x23FA
+        | 0x24C2
+        | 0x25AA | 0x25AB | 0x25B6 | 0x25C0 | 0x25FB..=0x25FE
+        | 0x2600..=0x27BF
+        | 0x2934 | 0x2935
+        | 0x2B05..=0x2B07 | 0x2B1B | 0x2B1C | 0x2B50 | 0x2B55
+        | 0x3030 | 0x303D
+        | 0x3297 | 0x3299
+        | 0x1F000..=0x1FAFF
+    )
+}
+
 fn pick_covering_slot(
     ch: char,
     current: Option<usize>,
@@ -914,6 +954,13 @@ fn pick_covering_slot(
 ) -> Option<usize> {
     if (ch as u32) <= 0x7F {
         return None;
+    }
+    if is_emoji_char(ch) {
+        for (ix, (fb_id, _)) in fallback_chain.iter().enumerate() {
+            if covers(*fb_id, ch) {
+                return Some(ix);
+            }
+        }
     }
     if covers(primary, ch) {
         return None;
@@ -989,8 +1036,11 @@ fn face_info_into_properties(
 }
 
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
-    // TODO: Include other common emoji fonts
-    postscript_name == "NotoColorEmoji"
+    let lower = postscript_name.to_ascii_lowercase();
+    lower == "notocoloremoji"
+        || lower == "noto color emoji"
+        || lower.contains("emoji")
+        || lower.contains("coloremoji")
 }
 
 #[cfg(test)]
